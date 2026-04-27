@@ -1,78 +1,97 @@
-import asyncio
 import logging
+import asyncio
+import os
+import sys
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ConversationHandler, MessageHandler, filters
-from config import BOT_TOKEN, PORT
-from handlers import (
-    start, cancel_test, age_handler, weight_handler, height_handler,
-    level_handler, goal_handler, start_training, handle_training_input,
-    progress, reset_test, AGE, WEIGHT, HEIGHT, LEVEL, GOAL, TRAINING
-)
 
-logging.basicConfig(level=logging.INFO)
+# Настройка подробного логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Создаём приложение бота
-app = (Application.builder().token(BOT_TOKEN).build())
-
-# ConversationHandler для теста
-conv_test = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
-    states={
-        AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, age_handler)],
-        WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, weight_handler)],
-        HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, height_handler)],
-        LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, level_handler)],
-        GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_handler)],
-    },
-    fallbacks=[MessageHandler(filters.Regex("^Отмена$"), cancel_test)],
-)
-
-# Регистрируем обработчики
-app.add_handler(conv_test)
-app.add_handler(MessageHandler(filters.Regex("^🏋️ Начать тренировку$"), start_training))
-app.add_handler(MessageHandler(filters.Regex("^📊 Мой прогресс$"), progress))
-app.add_handler(MessageHandler(filters.Regex("^🔄 Сбросить тест$"), reset_test))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_training_input))
-
-async def health(request):
-    return web.Response(text="OK")
-
-async def main():
-    # Инициализируем БД (один раз при запуске)
+# Импорт ваших модулей
+try:
+    from config import BOT_TOKEN, PORT
     from db import init_db
+    from handlers import (
+        start, cancel_test, age_handler, weight_handler, height_handler,
+        level_handler, goal_handler, start_training, handle_training_input,
+        progress, reset_test, AGE, WEIGHT, HEIGHT, LEVEL, GOAL, TRAINING
+    )
+except Exception as e:
+    logger.exception("Ошибка импорта модулей. Проверьте структуру проекта.")
+    sys.exit(1)
+
+def main():
+    # Создаём приложение бота
+    app = (Application.builder().token(BOT_TOKEN).build())
+
+    # ConversationHandler для теста
+    conv_test = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, age_handler)],
+            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, weight_handler)],
+            HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, height_handler)],
+            LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, level_handler)],
+            GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, goal_handler)],
+        },
+        fallbacks=[MessageHandler(filters.Regex("^Отмена$"), cancel_test)],
+    )
+
+    app.add_handler(conv_test)
+    app.add_handler(MessageHandler(filters.Regex("^🏋️ Начать тренировку$"), start_training))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Мой прогресс$"), progress))
+    app.add_handler(MessageHandler(filters.Regex("^🔄 Сбросить тест$"), reset_test))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_training_input))
+
+    return app
+
+async def run():
+    # Инициализируем БД
+    logger.info("Инициализация базы данных...")
     await init_db()
-    
-    # Устанавливаем вебхук
-    # Render даёт URL вида https://app-name.onrender.com
-    # Получаем его из переменной окружения RENDER_EXTERNAL_URL или хардкодим? Лучше передать.
-    # Для простоты предположим, что URL = "https://ваше-имя.onrender.com"
-    # В render нужно задать переменную окружения RENDER_EXTERNAL_URL
-    import os
+    logger.info("База данных готова.")
+
+    # Получаем URL вебхука
     webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not webhook_url:
-        raise ValueError("RENDER_EXTERNAL_URL not set")
+        logger.error("Переменная окружения RENDER_EXTERNAL_URL не установлена!")
+        # Для отладки можно использовать polling, но в render нужен вебхук
+        logger.info("Проверьте, что вы добавили переменную RENDER_EXTERNAL_URL в Environment Variables.")
+        sys.exit(1)
     webhook_url += "/webhook"
-    await app.bot.set_webhook(webhook_url)
-    
-    # Создаём aiohttp веб-сервер
+    logger.info(f"Устанавливаю вебхук: {webhook_url}")
+
+    bot_app = main()
+    await bot_app.bot.set_webhook(webhook_url)
+
+    # aiohttp веб-сервер
     async def webhook_handler(request):
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
-        return web.Response()
-    
+        try:
+            data = await request.json()
+            update = Update.de_json(data, bot_app.bot)
+            await bot_app.process_update(update)
+            return web.Response()
+        except Exception as e:
+            logger.exception("Ошибка при обработке вебхука")
+            return web.Response(status=500)
+
     web_app = web.Application()
     web_app.router.add_post("/webhook", webhook_handler)
-    web_app.router.add_get("/health", health)
-    
+    web_app.router.add_get("/health", lambda r: web.Response(text="OK"))
+
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info(f"Webhook listening on port {PORT}")
-    await asyncio.Event().wait()  # бесконечно слушаем
+    logger.info(f"Бот запущен на порту {PORT}, ожидание вебхуков...")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        logger.exception("Критическая ошибка в основном цикле")
+        sys.exit(1)
